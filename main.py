@@ -12,7 +12,7 @@ VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
 DATA_DIR = "data"
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.txt")
-LOG_FILE = "miza_bot_v13.log"
+LOG_FILE = "miza_news_v14.log"
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -78,52 +78,67 @@ def fetch_feeds(days=7):
     return results
 
 # ======================
-# GIÁ CỔ PHIẾU MZG 📈
+# GIÁ CỔ PHIẾU MZG 📈 (SỬA HOÀN TOÀN)
 # ======================
 def get_mzg_price():
-    """Lấy giá MZG gần nhất, fallback nếu lỗi, xử lý cuối tuần"""
+    """
+    Lấy giá cổ phiếu MZG gần nhất:
+    ✅ Ưu tiên lấy từ CafeF (s.cafef.vn)
+    ✅ Fallback sang 24hMoney.vn nếu lỗi
+    ✅ Tự động lấy giá của phiên Thứ 6 nếu là Thứ 7 hoặc CN
+    ✅ Hiển thị rõ thời gian cập nhật
+    """
     today = datetime.now(VN_TZ)
-    weekday = today.weekday()
+    weekday = today.weekday()  # Monday=0, Sunday=6
     if weekday >= 5:  # Thứ 7 hoặc CN
         target_day = today - timedelta(days=weekday - 4)
     else:
         target_day = today
 
-    # CafeF
+    # ----------- CAFE.F (ưu tiên) -----------
     try:
         url = "https://s.cafef.vn/upcom/MZG-cong-ty-co-phan-miza.chn"
         res = requests.get(url, timeout=10)
         res.encoding = "utf-8"
 
-        match_price = re.search(r'<div class="price-item text-lg">([\d.,]+)</div>', res.text)
-        match_change = re.search(r'<div class="price-change[^>]*">([^<]+)</div>', res.text)
-        match_time = re.search(r"Cập nhật lúc\s*([\d: ]+\d{2}/\d{2})", res.text)
+        # Tìm giá, thay đổi, thời gian cập nhật
+        price_match = re.search(r'class="price-item[^>]*">([\d.,]+)</div>', res.text)
+        change_match = re.search(r'class="price-change[^>]*">([^<]+)</div>', res.text)
+        time_match = re.search(r'Cập nhật lúc\s*([\d: ]+\d{2}/\d{2})', res.text)
 
-        if match_price:
-            val = match_price.group(1).replace(",", "").replace(".", "")
-            price = float(val) if len(val) > 3 else float(match_price.group(1).replace(",", "."))
-            change = match_change.group(1).strip() if match_change else "0%"
-            updated_time = match_time.group(1) if match_time else target_day.strftime("%H:%M %d/%m")
+        if price_match:
+            raw = price_match.group(1)
+            try:
+                if "," in raw and "." in raw:
+                    price = float(raw.replace(",", "").replace(".", ""))
+                elif "," in raw:
+                    price = float(raw.replace(",", "."))
+                else:
+                    price = float(raw)
+            except:
+                price = float(raw.replace(".", "").replace(",", "."))
+            change = change_match.group(1).strip() if change_match else "0%"
+            updated_time = time_match.group(1) if time_match else target_day.strftime("%H:%M %d/%m")
             return price, change, updated_time
     except Exception as e:
         logging.error(f"CafeF fetch error: {e}")
 
-    # 24hMoney
+    # ----------- 24HMONEY (fallback) -----------
     try:
         url = "https://24hmoney.vn/ma-chung-khoan/MZG"
         res = requests.get(url, timeout=10)
         res.encoding = "utf-8"
-        match_price = re.search(r'"currentPrice":\s*([\d.]+)', res.text)
-        match_change = re.search(r'"changePercent":\s*"([^"]+)"', res.text)
-
-        if match_price:
-            price = float(match_price.group(1))
-            change = match_change.group(1) if match_change else "N/A"
+        price_match = re.search(r'"currentPrice":\s*([\d.]+)', res.text)
+        change_match = re.search(r'"changePercent":\s*"([^"]+)"', res.text)
+        if price_match:
+            price = float(price_match.group(1))
+            change = change_match.group(1) if change_match else "N/A"
             updated_time = target_day.strftime("%H:%M %d/%m")
             return price, change, updated_time
     except Exception as e:
         logging.error(f"24hMoney fetch error: {e}")
 
+    # ----------- Nếu không tìm thấy -----------
     return None, None, None
 
 # ======================
@@ -171,14 +186,14 @@ def job_daily_summary():
     logging.info("✅ Sent daily summary.")
 
 # ======================
-# REAL-TIME MONITORING (20 phút cho tin mới 48h)
+# REALTIME CHECK (48h + gửi trễ 20 phút)
 # ======================
 def schedule_delayed_send(item):
     """Gửi tin mới sau 20 phút"""
-    time.sleep(1200)  # 20 phút = 1200 giây
+    time.sleep(1200)
     msg = f"🆕 <b>Tin mới đăng từ Miza:</b>\n\n<b>{item['title']}</b>\n🗓️ {item['date'].strftime('%H:%M %d/%m/%Y')}\n🔗 {shorten_url(item['link'])}"
     send_telegram(msg)
-    logging.info(f"🚀 Sent delayed news: {item['title']}")
+    logging.info(f"🚀 Gửi tin mới sau 20 phút: {item['title']}")
 
 def job_realtime_check():
     sent = load_sent()
@@ -187,14 +202,14 @@ def job_realtime_check():
     for item in feeds:
         if item["link"] not in sent:
             hours_diff = (datetime.now(VN_TZ) - item["date"]).total_seconds() / 3600
-            if hours_diff <= 48:  # Tin mới trong 48 tiếng
+            if hours_diff <= 48:
                 new_items.append(item)
                 save_sent(item["link"])
                 threading.Thread(target=schedule_delayed_send, args=(item,)).start()
 
     if new_items:
         now = datetime.now(VN_TZ)
-        logging.info(f"🚨 Phát hiện {len(new_items)} tin mới - {now.strftime('%H:%M %d/%m')}")
+        logging.info(f"🚨 Phát hiện {len(new_items)} tin mới lúc {now.strftime('%H:%M %d/%m')}")
     else:
         print("⏳ Không có tin mới (check 20 phút).")
 
@@ -215,8 +230,8 @@ def job_stock_update():
 # MAIN LOOP
 # ======================
 def main():
-    logging.info("🚀 Miza Bot (v13) started.")
-    send_telegram("🚀 Miza Bot v13 – Tin mới trong 48h gửi sau 20 phút + giá MZG thực tế.")
+    logging.info("🚀 Miza Bot v14 started.")
+    send_telegram("🚀 Miza Bot v14 – Bản tối ưu: giá MZG thật, tin mới gửi sau 20 phút, lấy giá Thứ 6 khi cuối tuần.")
 
     schedule.every().day.at("09:00").do(job_daily_summary)
     schedule.every().day.at("09:00").do(job_stock_update)
