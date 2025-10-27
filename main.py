@@ -12,7 +12,7 @@ VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
 DATA_DIR = "data"
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.txt")
-LOG_FILE = "miza_news_rss_v12.log"
+LOG_FILE = "miza_news_final.log"
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -48,7 +48,7 @@ def fetch_feeds(days=7):
     cutoff = now - timedelta(days=days)
 
     feeds = [
-        "https://news.google.com/rss/search?q=Miza|MZG|Miza+Group|Giấy+Miza|Công+ty+Cổ+phần+Miza&hl=vi&gl=VN&ceid=VN:vi",
+        "https://news.google.com/rss/search?q=Miza|MZG|Giấy+Miza|Công+ty+Cổ+phần+Miza&hl=vi&gl=VN&ceid=VN:vi",
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCd2aU53aTTxxLONczZc34BA"
     ]
 
@@ -79,32 +79,62 @@ def fetch_feeds(days=7):
     return results
 
 # ======================
-# GIÁ CỔ PHIẾU MZG 📈
+# GIÁ CỔ PHIẾU MZG 📈 (CẬP NHẬT CHUẨN)
 # ======================
 def get_mzg_price():
-    """Lấy giá MZG gần nhất (thứ 7/CN -> giá thứ 6)"""
+    """
+    Lấy giá MZG gần nhất từ CafeF hoặc 24hMoney.
+    Nếu là Thứ 7/CN -> tự động lấy giá phiên Thứ 6 gần nhất.
+    """
     today = datetime.now(VN_TZ)
     weekday = today.weekday()
-    if weekday >= 5:
+    if weekday >= 5:  # Thứ 7 hoặc CN
         target_day = today - timedelta(days=weekday - 4)
     else:
         target_day = today
 
+    # ---- ƯU TIÊN CAFE.F ----
     try:
-        url = "https://cafef.vn/du-lieu/upcom/mzg-cong-ty-co-phan-miza.chn"
+        url = "https://s.cafef.vn/upcom/MZG-cong-ty-co-phan-miza.chn"
         res = requests.get(url, timeout=10)
         res.encoding = "utf-8"
-        match_price = re.search(r"Giá hiện tại.*?(\d{1,3}(?:\.\d{3})*)", res.text)
-        match_change = re.search(r"([-+]?\d+\.\d+|\+\d+|\-\d+|\d+)%", res.text)
-        match_time = re.search(r"Cập nhật lúc\s*(\d{2}:\d{2}:\d{2}\s*\d{2}/\d{2})", res.text)
+
+        # Lấy giá hiện tại
+        match_price = re.search(r'<div class="price-item[^>]*">([\d.,]+)</div>', res.text)
+        # Lấy thay đổi %
+        match_change = re.search(r'<div class="price-change[^>]*">([^<]+)</div>', res.text)
+        # Lấy thời gian cập nhật (nếu có)
+        match_time = re.search(r"Cập nhật lúc\s*([\d: ]+\d{2}/\d{2})", res.text)
 
         if match_price:
-            price = float(match_price.group(1).replace(".", ""))
-            change = match_change.group(1) if match_change else "0%"
+            # xử lý giá -> 15.20 hoặc 15,200
+            val = match_price.group(1).replace(",", "").replace(".", "")
+            if len(val) > 3:
+                price = float(val)
+            else:
+                price = float(match_price.group(1).replace(",", "."))
+            change = match_change.group(1).strip() if match_change else "0%"
             updated_time = match_time.group(1) if match_time else target_day.strftime("%H:%M %d/%m")
             return price, change, updated_time
+
     except Exception as e:
-        logging.error(f"MZG fetch error: {e}")
+        logging.error(f"CafeF fetch error: {e}")
+
+    # ---- FALLBACK 24hMONEY ----
+    try:
+        url = "https://24hmoney.vn/ma-chung-khoan/MZG"
+        res = requests.get(url, timeout=10)
+        res.encoding = "utf-8"
+        match = re.search(r'"currentPrice":\s*([\d.]+)', res.text)
+        match_change = re.search(r'"changePercent":\s*"([^"]+)"', res.text)
+        if match:
+            price = float(match.group(1).replace(".", ""))
+            change = match_change.group(1) if match_change else "N/A"
+            updated_time = target_day.strftime("%H:%M %d/%m")
+            return price, change, updated_time
+    except Exception as e:
+        logging.error(f"24hMoney fetch error: {e}")
+
     return None, None, None
 
 # ======================
@@ -140,6 +170,8 @@ def job_daily_summary():
     header = f"📢 <b>Tổng hợp tin Miza (7 ngày gần nhất) - {now.strftime('%H:%M %d/%m')}</b>\n\n"
     if price:
         header += f"📈 Giá cổ phiếu MZG: <b>{price:.2f} VNĐ</b> ({change})\n🕓 Cập nhật: {updated_time}\n\n"
+    else:
+        header += "⚠️ Không lấy được giá MZG.\n\n"
 
     if not news:
         send_telegram(header + "⚠️ Không có tin mới về Miza.")
@@ -186,8 +218,8 @@ def job_stock_update():
 # MAIN LOOP
 # ======================
 def main():
-    logging.info("🚀 Miza News Bot RSS started.")
-    send_telegram("🚀 Miza News Bot RSS khởi động – hiển thị ngày đăng thật & giá MZG thực tế.")
+    logging.info("🚀 Miza News Bot RSS started (FINAL).")
+    send_telegram("🚀 Miza News Bot RSS (FINAL) – hiển thị ngày đăng thật & giá MZG thực tế.")
 
     schedule.every().day.at("09:00").do(job_daily_summary)
     schedule.every().day.at("09:00").do(job_stock_update)
