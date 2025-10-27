@@ -13,7 +13,7 @@ RAPID_KEY = os.getenv("RAPID_API_KEY")
 
 DATA_DIR = "data"
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.txt")
-LOG_FILE = "miza_news_vn_v5.log"
+LOG_FILE = "miza_news_vn_v6_price_latest.log"
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -21,7 +21,7 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s -
 # TELEGRAM
 # ======================
 def send_telegram(msg):
-    """Gửi tin nhắn Telegram"""
+    """Gửi tin nhắn Telegram tới tất cả chat id"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for chat_id in CHAT_IDS:
         try:
@@ -34,19 +34,15 @@ def send_telegram(msg):
 # STORAGE
 # ======================
 def load_sent():
-    """Đọc danh sách link đã gửi"""
     return set(open(SENT_FILE, encoding="utf-8").read().splitlines()) if os.path.exists(SENT_FILE) else set()
 
 def save_sent(link):
-    """Lưu link đã gửi"""
     with open(SENT_FILE, "a", encoding="utf-8") as f:
         f.write(link + "\n")
 
 # ======================
 # GOOGLE NEWS 🇻🇳
-# ======================
 def get_google_news(days=7):
-    """Lấy tin Google News VN, chỉ tin về Miza (MZG)"""
     feeds = [
         "https://news.google.com/rss/search?q=Miza|MZG|Giấy+Miza|Công+ty+Cổ+phần+Miza|Nhà+máy+Miza+Nghi+Sơn&hl=vi&gl=VN&ceid=VN:vi"
     ]
@@ -67,15 +63,31 @@ def get_google_news(days=7):
             if not any(k.lower() in title.lower() for k in ["miza", "mzg", "giấy", "nghi sơn"]):
                 continue
             source = e.get("source", {}).get("title", "")
-            results.append({"title": title, "link": link, "date": pub_dt, "source": source})
+            results.append({
+                "title": title,
+                "link": link,
+                "date": pub_dt,
+                "source": source
+            })
     results.sort(key=lambda x: x["date"], reverse=True)
     return results
 
 # ======================
 # YOUTUBE 🇻🇳
-# ======================
+def parse_vn_date(date_str):
+    """Chuyển chuỗi ngày YouTube (ví dụ '18 thg 10, 2025') thành datetime"""
+    try:
+        m = re.search(r"(\d+)\s*thg\s*(\d+),\s*(\d{4})", date_str)
+        if m:
+            day = int(m.group(1))
+            month = int(m.group(2))
+            year = int(m.group(3))
+            return datetime(year, month, day, tzinfo=VN_TZ)
+    except Exception as e:
+        logging.error(f"Parse YouTube date error: {e}")
+    return datetime.now(VN_TZ)
+
 def get_youtube_videos(query="MIZA CORP"):
-    """Lấy video từ kênh MIZA chính thức"""
     url = f"https://youtube138.p.rapidapi.com/search/?q={query}&hl=vi&gl=VN"
     headers = {"x-rapidapi-host": "youtube138.p.rapidapi.com", "x-rapidapi-key": RAPID_KEY}
     results = []
@@ -93,38 +105,41 @@ def get_youtube_videos(query="MIZA CORP"):
             if any(x in title.lower() for x in ["myra", "remix", "show", "ca khúc", "mv", "live", "trần", "music"]):
                 continue
             vid = video.get("videoId")
+            published = video.get("publishedTimeText", "")
+            date_pub = parse_vn_date(published)
             results.append({
                 "title": title,
                 "link": f"https://www.youtube.com/watch?v={vid}",
-                "date": datetime.now(VN_TZ),
+                "date": date_pub,
                 "source": author or "YouTube"
             })
     except Exception as e:
         logging.error(f"YouTube API error: {e}")
+    results.sort(key=lambda x: x["date"], reverse=True)
     return results
 
 # ======================
 # GIÁ CỔ PHIẾU MZG 📈
-# ======================
 def get_mzg_price():
-    """Lấy giá cổ phiếu MZG hiện tại từ 24hmoney"""
+    """Lấy giá cổ phiếu MZG gần nhất từ nguồn Việt Nam"""
     try:
-        url = "https://24hmoney.vn/ma-chung-khoan/MZG"
+        url = "https://cafef.vn/du-lieu/upcom/mzg-cong-ty-co-phan-miza.chn"
         res = requests.get(url, timeout=10)
         res.encoding = "utf-8"
-        match = re.search(r'(\d{1,3}(?:\.\d{3})*)(?:<\/div>\s*<div[^>]*>0\.00|\s*<\/span>)', res.text)
-        if match:
-            price = float(match.group(1).replace(".", ""))
+        # Tìm đoạn giá trong trang
+        m = re.search(r"Giá cổ phiếu.*?(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*VNĐ", res.text)
+        if m:
+            # xử lý dấu '.' và ',' nếu có
+            val = m.group(1).replace(".", "").replace(",", ".")
+            price = float(val)
             return price
     except Exception as e:
         logging.error(f"MZG price fetch error: {e}")
     return None
 
 # ======================
-# SHORTEN URL (is.gd)
-# ======================
+# SHORTEN URL
 def shorten_url(url):
-    """Dùng is.gd thay TinyURL (đảm bảo mở trực tiếp)"""
     try:
         r = requests.get(f"https://is.gd/create.php?format=simple&url={url}", timeout=5)
         return r.text if r.status_code == 200 else url
@@ -133,21 +148,19 @@ def shorten_url(url):
 
 # ======================
 # FORMAT
-# ======================
 def format_news(title, items):
     if not items:
         return ""
     lines = []
     for i, item in enumerate(items, 1):
         short = shorten_url(item["link"])
-        src = f" - {item['source']}" if item.get("source") else ""
-        date_str = item["date"].strftime("%d/%m/%Y %H:%M")
-        lines.append(f"{i}. <b>{item['title']}</b>{src}\n🕓 {date_str}\n🔗 {short}")
+        src = f" - {item.get('source', '')}" if item.get("source") else ""
+        date_str = item["date"].strftime("%d/%m/%Y")
+        lines.append(f"{i}. <b>{item['title']}</b>{src}\n🗓️ {date_str}\n🔗 {short}")
     return f"<b>{title}</b>\n\n" + "\n\n".join(lines)
 
 # ======================
 # TỔNG HỢP 9H SÁNG
-# ======================
 def job_daily_summary():
     now = datetime.now(VN_TZ)
     start_date = (now - timedelta(days=8)).strftime("%d/%m")
@@ -157,7 +170,10 @@ def job_daily_summary():
     yt = get_youtube_videos("MIZA CORP")
 
     price = get_mzg_price()
-    price_line = f"📈 Giá cổ phiếu <b>MZG</b> hiện tại: <b>{price:.2f} VND</b>\n\n" if price else "📈 Giá cổ phiếu MZG: <i>chưa cập nhật</i>\n\n"
+    if price is not None:
+        price_line = f"📈 Giá cổ phiếu <b>MZG</b> gần nhất: <b>{price:.2f} VNĐ</b>\n\n"
+    else:
+        price_line = "📈 Giá cổ phiếu MZG: <i>chưa cập nhật</i>\n\n"
 
     header = f"📢 <b>Tổng hợp tin Miza ({start_date} → {end_date})</b>\n\n"
     body = format_news("📰 Tin tức báo chí", news[:10]) + "\n\n" + format_news("🎥 Video YouTube", yt[:5])
@@ -166,7 +182,6 @@ def job_daily_summary():
 
 # ======================
 # REALTIME 48H
-# ======================
 def job_realtime():
     sent = load_sent()
     new_items = []
@@ -189,13 +204,12 @@ def job_realtime():
         print("⏳ Không có tin mới (check 20 phút).")
 
 # ======================
-# GIÁ CỔ PHIẾU MZG (3 KHUNG GIỜ)
-# ======================
+# GIÁ CỔ PHIẾU MZG (3 KHUNG GIỜ: 9h, 12h, 15h)
 def job_stock_update():
     now = datetime.now(VN_TZ)
     price = get_mzg_price()
-    if price:
-        msg = f"📈 <b>Giá cổ phiếu MZG</b> lúc {now.strftime('%H:%M %d/%m')} là <b>{price:.2f} VND</b>"
+    if price is not None:
+        msg = f"📈 <b>Giá cổ phiếu MZG</b> lúc {now.strftime('%H:%M %d/%m')} là <b>{price:.2f} VNĐ</b>"
     else:
         msg = f"📉 Không lấy được giá MZG lúc {now.strftime('%H:%M %d/%m')}"
     send_telegram(msg)
@@ -204,23 +218,17 @@ def job_stock_update():
 
 # ======================
 # MAIN
-# ======================
 def main():
-    logging.info("🚀 Miza News Bot VN started (v5).")
-    send_telegram("🚀 Miza Bot VN khởi động (v5) – có thêm lịch cập nhật giá cổ phiếu MZG 9h, 12h, 15h.")
+    logging.info("🚀 Miza News Bot VN started (v6-price-latest).")
+    send_telegram("🚀 Miza Bot VN khởi động (v6-price-latest) – giá cổ phiếu MZG đã lấy **giá gần nhất**.")
 
-    # Gửi tổng hợp lúc 9h sáng
     schedule.every().day.at("09:00").do(job_daily_summary)
-
-    # Tin mới 48h gửi mỗi 20 phút
     schedule.every(20).minutes.do(job_realtime)
-
-    # Giá cổ phiếu MZG – 3 lần/ngày
     schedule.every().day.at("09:00").do(job_stock_update)
     schedule.every().day.at("12:00").do(job_stock_update)
     schedule.every().day.at("15:00").do(job_stock_update)
 
-    # Chạy ngay lúc khởi động
+    # Khởi chạy ngay khi bắt đầu
     job_realtime()
     job_stock_update()
 
