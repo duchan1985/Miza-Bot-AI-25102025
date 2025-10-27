@@ -1,4 +1,4 @@
-import os, time, logging, requests, feedparser, schedule, pytz
+import os, time, logging, requests, feedparser, schedule, pytz, re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -34,34 +34,44 @@ def send_telegram(msg):
 # STORAGE
 # ======================
 def load_sent():
+    """Đọc danh sách link đã gửi"""
     return set(open(SENT_FILE, encoding="utf-8").read().splitlines()) if os.path.exists(SENT_FILE) else set()
 
 def save_sent(link):
+    """Lưu link đã gửi"""
     with open(SENT_FILE, "a", encoding="utf-8") as f:
         f.write(link + "\n")
 
 # ======================
 # GOOGLE NEWS 🇻🇳
 # ======================
-def get_google_news(days=20):
-    """Lấy tin Google News (nguồn Việt Nam, ngôn ngữ tiếng Việt)"""
+def get_google_news(days=7):
+    """Lấy tin Google News (chỉ bài đăng trong 7 ngày và đúng năm hiện tại)"""
     feeds = [
         "https://news.google.com/rss/search?q=Miza|MZG|Miza+Group|Mizagroup|Giấy+Miza|Công+ty+Cổ+phần+Miza|Miza+Nghi+Sơn&hl=vi&gl=VN&ceid=VN:vi"
     ]
     now = datetime.now(VN_TZ)
     cutoff = now - timedelta(days=days)
-    sent, results = load_sent(), []
+    results = []
 
     for url in feeds:
         feed = feedparser.parse(url)
         for e in feed.entries:
             link = e.get("link", "")
             pub = e.get("published_parsed")
-            if not link or link in sent:
+            if not pub:
                 continue
-            pub_dt = datetime(*pub[:6], tzinfo=pytz.utc).astimezone(VN_TZ) if pub else now
+
+            pub_dt = datetime(*pub[:6], tzinfo=pytz.utc).astimezone(VN_TZ)
+
+            # ❌ Chặn tin khác năm hiện tại
+            if pub_dt.year != now.year:
+                continue
+
+            # ❌ Chặn tin cũ hơn 7 ngày
             if pub_dt < cutoff:
                 continue
+
             title = e.get("title", "Không có tiêu đề")
             source = e.get("source", {}).get("title", "")
             results.append({
@@ -70,15 +80,15 @@ def get_google_news(days=20):
                 "date": pub_dt,
                 "source": source
             })
-            save_sent(link)
+
     results.sort(key=lambda x: x["date"], reverse=True)
-    return results[:10]
+    return results
 
 # ======================
-# YOUTUBE 🇻🇳 (RapidAPI)
+# YOUTUBE 🇻🇳
 # ======================
 def get_youtube_videos(query="Miza Việt Nam"):
-    """Lấy video YouTube có ngôn ngữ và khu vực VN"""
+    """Lấy video YouTube (VN)"""
     url = f"https://youtube138.p.rapidapi.com/search/?q={query}&hl=vi&gl=VN"
     headers = {"x-rapidapi-host": "youtube138.p.rapidapi.com", "x-rapidapi-key": RAPID_KEY}
     results = []
@@ -90,16 +100,37 @@ def get_youtube_videos(query="Miza Việt Nam"):
             if video:
                 title = video.get("title", "")
                 vid = video.get("videoId")
-                # Lọc video không phải tiếng Việt
-                if any(x in title.lower() for x in ["official", "mv", "music", "remix", "lyrics", "song"]):
+                if any(x in title.lower() for x in ["music", "mv", "remix", "lyrics", "song"]):
                     continue
-                results.append(f"🎥 <b>{title}</b>\n🔗 https://www.youtube.com/watch?v={vid}")
+                results.append({
+                    "title": title,
+                    "link": f"https://www.youtube.com/watch?v={vid}",
+                    "date": datetime.now(VN_TZ),
+                    "source": "YouTube"
+                })
     except Exception as e:
         logging.error(f"YouTube API error: {e}")
-    return results[:5]
+    return results
 
 # ======================
-# RÚT GỌN LINK
+# GIÁ CỔ PHIẾU MZG 📈
+# ======================
+def get_mzg_price_previous():
+    """Lấy giá cổ phiếu MZG đóng cửa phiên trước từ Vietstock"""
+    try:
+        url = "https://finance.vietstock.vn/MZG-ctcp-miza.htm"
+        res = requests.get(url, timeout=10)
+        res.encoding = "utf-8"
+        match = re.search(r'Giá đóng cửa.*?(\d{1,3}(?:\.\d{3})*)', res.text)
+        if match:
+            price = match.group(1).replace(".", "")
+            return int(price)
+    except Exception as e:
+        logging.error(f"MZG price fetch error: {e}")
+    return None
+
+# ======================
+# SHORTEN URL
 # ======================
 def shorten_url(url):
     try:
@@ -109,57 +140,86 @@ def shorten_url(url):
         return url
 
 # ======================
-# FORMAT HIỂN THỊ
+# FORMAT
 # ======================
-def format_message(title, items):
+def format_news(title, items):
+    """Hiển thị danh sách tin có ngày đăng"""
     if not items:
         return ""
     lines = []
     for i, item in enumerate(items, 1):
-        if isinstance(item, dict):
-            short = shorten_url(item["link"])
-            src = f" - {item['source']}" if item.get("source") else ""
-            lines.append(f"{i}. <b>{item['title']}</b>{src}\n🔗 {short}")
-        else:
-            lines.append(f"{i}. {item}")
+        short = shorten_url(item["link"])
+        src = f" - {item['source']}" if item.get("source") else ""
+        date_str = item["date"].strftime("%d/%m/%Y %H:%M")
+        lines.append(f"{i}. <b>{item['title']}</b>{src}\n🕓 {date_str}\n🔗 {short}")
     return f"<b>{title}</b>\n\n" + "\n\n".join(lines)
 
 # ======================
-# JOB CHÍNH
+# TỔNG HỢP HÀNG NGÀY (9H)
 # ======================
-def job_20days():
-    send_telegram("🤖 Miza Bot đang tổng hợp tin tức Việt Nam (20 ngày gần nhất)...")
-
-    news = get_google_news()
-    yt = get_youtube_videos("Miza Việt Nam OR Giấy Miza OR MZG OR Miza Group")
-
-    sections = [
-        ("📰 Tin tức báo chí", news),
-        ("🎥 Video YouTube", yt)
-    ]
-
+def job_daily_summary():
     now = datetime.now(VN_TZ)
-    header = f"🆕 <b>Tin Miza mới phát sinh ({now.strftime('%H:%M %d/%m')})</b>\n\n"
+    start_date = (now - timedelta(days=8)).strftime("%d/%m")
+    end_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")
 
-    body = "\n\n\n".join(format_message(title, items) for title, items in sections if items)
-    if body:
-        send_telegram(header + body)
-        print(header + body)
-        logging.info("✅ Sent update to Telegram.")
+    news = get_google_news(days=7)
+    yt = get_youtube_videos("Miza Việt Nam")
+
+    # Lấy giá cổ phiếu hôm trước
+    mzg_price = get_mzg_price_previous()
+    if mzg_price:
+        price_line = f"📈 Giá cổ phiếu <b>MZG</b> đóng cửa phiên {end_date}: <b>{mzg_price:,} VND</b>\n\n"
     else:
-        print("⏳ Không có tin mới (check).")
+        price_line = "📈 Giá cổ phiếu MZG: <i>chưa cập nhật được</i>\n\n"
+
+    header = f"📢 <b>Tổng hợp tin Miza ({start_date} → {end_date})</b>\n\n"
+    body = format_news("📰 Tin tức báo chí", news[:10]) + "\n\n" + format_news("🎥 Video YouTube", yt[:5])
+
+    send_telegram(price_line + header + body)
+    logging.info("✅ Sent daily summary.")
+    print(f"✅ Gửi tổng hợp tin 9h sáng ({start_date} → {end_date}).")
 
 # ======================
-# MAIN LOOP
+# GỬI TIN MỚI TRONG 48H
+# ======================
+def job_realtime():
+    sent = load_sent()
+    new_items = []
+    feeds = get_google_news(days=2) + get_youtube_videos("Miza Việt Nam")
+
+    for item in feeds:
+        if item["link"] not in sent:
+            hours_diff = (datetime.now(VN_TZ) - item["date"]).total_seconds() / 3600
+            if hours_diff <= 48:  # chỉ gửi tin trong 48 giờ qua
+                new_items.append(item)
+                save_sent(item["link"])
+
+    if new_items:
+        now = datetime.now(VN_TZ)
+        header = f"🆕 <b>Tin Miza mới (48h gần nhất) - {now.strftime('%H:%M %d/%m')}</b>\n\n"
+        body = format_news("Bài mới phát sinh", new_items[:10])
+        send_telegram(header + body)
+        print(f"🚨 Gửi {len(new_items)} tin mới phát sinh (48h).")
+        logging.info(f"🚨 Sent {len(new_items)} new items (48h).")
+    else:
+        print("⏳ Không có tin mới (check 20 phút).")
+
+# ======================
+# MAIN
 # ======================
 def main():
-    logging.info("🚀 Miza News Bot VN started.")
-    send_telegram("🚀 Miza News Bot VN khởi động thành công.")
-    job_20days()
-    # Tổng hợp mỗi ngày lúc 9h sáng
-    schedule.every().day.at("09:00").do(job_20days)
-    # Kiểm tra tin mới mỗi 5 phút
-    schedule.every(5).minutes.do(job_20days)
+    logging.info("🚀 Miza News Bot (VN - 7 ngày + 48h + Giá cổ phiếu + Lọc năm hiện tại) started.")
+    send_telegram("🚀 Miza Bot VN khởi động (7 ngày + 48h + Giá cổ phiếu + Lọc năm hiện tại).")
+
+    # Gửi tổng hợp lúc 9h sáng
+    schedule.every().day.at("09:00").do(job_daily_summary)
+
+    # Kiểm tra tin mới mỗi 20 phút
+    schedule.every(20).minutes.do(job_realtime)
+
+    # Chạy ngay khi khởi động
+    job_realtime()
+
     while True:
         schedule.run_pending()
         time.sleep(60)
