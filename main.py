@@ -13,7 +13,7 @@ RAPID_KEY = os.getenv("RAPID_API_KEY")
 
 DATA_DIR = "data"
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.txt")
-LOG_FILE = "miza_news_vn_v10.log"
+LOG_FILE = "miza_news_vn_v11.log"
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -79,31 +79,37 @@ def get_google_news(days=7):
 def parse_vn_date(date_str):
     """
     Chuẩn hóa và phân tích ngày tiếng Việt từ YouTube hoặc bài báo.
-    Hỗ trợ các dạng:
+    Hỗ trợ:
     - 'Đã công chiếu vào 14 thg 10, 2025'
-    - 'Công chiếu vào 30 thg 9'
-    - '14 thg 10, 2025'
     - '14 thg 10'
+    - '5 tháng trước', '3 tuần trước', '10 ngày trước'
     """
     try:
         if not date_str:
             return None
-
         s = date_str.lower().strip()
         s = re.sub(r"(đã|công chiếu|đăng|vào|on|ra mắt|phát hành)", "", s).strip()
 
-        # Có năm
+        # Ngày có năm
         match_year = re.search(r"(\d{1,2})\s*thg\s*(\d{1,2}),?\s*(\d{4})", s)
         if match_year:
             d, m, y = int(match_year.group(1)), int(match_year.group(2)), int(match_year.group(3))
             return datetime(y, m, d, tzinfo=VN_TZ)
 
-        # Không có năm -> mặc định năm hiện tại
+        # Ngày không có năm
         match_no_year = re.search(r"(\d{1,2})\s*thg\s*(\d{1,2})", s)
         if match_no_year:
             d, m = int(match_no_year.group(1)), int(match_no_year.group(2))
             current_year = datetime.now(VN_TZ).year
             return datetime(current_year, m, d, tzinfo=VN_TZ)
+
+        # Dạng tương đối: "5 tháng trước", "3 tuần trước", "10 ngày trước"
+        match_relative = re.search(r"(\d+)\s*(tháng|tuần|ngày)\s*trước", s)
+        if match_relative:
+            num = int(match_relative.group(1))
+            unit = match_relative.group(2)
+            delta = timedelta(days=num * 30 if unit == "tháng" else num * 7 if unit == "tuần" else num)
+            return datetime.now(VN_TZ) - delta
 
     except Exception as e:
         logging.error(f"Parse VN date error: {e}")
@@ -128,8 +134,6 @@ def get_youtube_videos(query="MIZA CORP"):
             author = video.get("author", {}).get("title", "")
             if not any(k in (author + title).lower() for k in ["miza", "mzg"]):
                 continue
-            if any(x in title.lower() for x in ["myra", "remix", "show", "mv", "trần", "music"]):
-                continue
             vid = video.get("videoId")
             pub_text = video.get("publishedTimeText", "")
             date_pub = parse_vn_date(pub_text)
@@ -150,13 +154,22 @@ def get_youtube_videos(query="MIZA CORP"):
 # GIÁ CỔ PHIẾU MZG 📈
 # ======================
 def get_mzg_price():
-    """Lấy giá MZG gần nhất từ CafeF hoặc 24hMoney, kèm thời gian cập nhật thực tế"""
+    """
+    Lấy giá MZG gần nhất từ CafeF hoặc 24hMoney.
+    Nếu là Thứ 7/CN thì lấy giá của Thứ 6 gần nhất.
+    """
+    today = datetime.now(VN_TZ)
+    weekday = today.weekday()  # Monday=0, Sunday=6
+    if weekday >= 5:  # Thứ 7 hoặc CN
+        target_day = today - timedelta(days=weekday - 4)  # Lùi về thứ 6
+    else:
+        target_day = today
+
     try:
         url = "https://cafef.vn/du-lieu/upcom/mzg-cong-ty-co-phan-miza.chn"
         res = requests.get(url, timeout=10)
         res.encoding = "utf-8"
 
-        # Giá, thay đổi, thời gian cập nhật
         match_price = re.search(r"Giá hiện tại.*?(\d{1,3}(?:\.\d{3})*)", res.text)
         match_change = re.search(r"([-+]?\d+\.\d+|\+\d+|\-\d+|\d+)%", res.text)
         match_time = re.search(r"Cập nhật lúc\s*(\d{2}:\d{2}:\d{2}\s*\d{2}/\d{2})", res.text)
@@ -164,7 +177,7 @@ def get_mzg_price():
         if match_price:
             price = float(match_price.group(1).replace(".", ""))
             change = match_change.group(1) if match_change else "0%"
-            updated_time = match_time.group(1) if match_time else datetime.now(VN_TZ).strftime("%H:%M %d/%m")
+            updated_time = match_time.group(1) if match_time else target_day.strftime("%H:%M %d/%m")
             return price, change, updated_time
 
     except Exception as e:
@@ -178,7 +191,7 @@ def get_mzg_price():
         match = re.search(r"(\d{1,3}(?:\.\d{3})*)(?:<\/div>\s*<div[^>]*>0\.00|\s*<\/span>)", res.text)
         if match:
             price = float(match.group(1).replace(".", ""))
-            updated_time = datetime.now(VN_TZ).strftime("%H:%M %d/%m")
+            updated_time = target_day.strftime("%H:%M %d/%m")
             return price, "N/A", updated_time
     except Exception as e:
         logging.error(f"24hMoney fetch error: {e}")
@@ -214,16 +227,13 @@ def format_news(title, items):
 # ======================
 def job_daily_summary():
     now = datetime.now(VN_TZ)
-    start_date = (now - timedelta(days=8)).strftime("%d/%m")
-    end_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")
-
     news = get_google_news(days=7)
     yt = get_youtube_videos("MIZA CORP")
 
     price, change, updated_time = get_mzg_price()
     price_line = f"📈 Giá cổ phiếu <b>MZG</b>: <b>{price:.2f} VNĐ</b> ({change})\n🕓 Cập nhật: {updated_time}\n\n" if price else "📉 Giá MZG: <i>chưa cập nhật</i>\n\n"
 
-    header = f"📢 <b>Tổng hợp tin Miza ({start_date} → {end_date})</b>\n\n"
+    header = f"📢 <b>Tổng hợp tin Miza ({(now - timedelta(days=7)).strftime('%d/%m')} → {now.strftime('%d/%m/%Y')})</b>\n\n"
     body = format_news("📰 Tin tức báo chí", news[:10]) + "\n\n" + format_news("🎥 Video YouTube", yt[:5])
     send_telegram(price_line + header + body)
     logging.info("✅ Sent daily summary.")
@@ -263,8 +273,8 @@ def job_stock_update():
 # MAIN
 # ======================
 def main():
-    logging.info("🚀 Miza News Bot VN started (v10).")
-    send_telegram("🚀 Miza Bot VN (v10) – Ngày phát hành thực & giá MZG mới nhất với thời gian cập nhật thực tế.")
+    logging.info("🚀 Miza News Bot VN started (v11).")
+    send_telegram("🚀 Miza Bot VN (v11) – ngày phát hành thực, hỗ trợ dạng 'tháng trước' & giá MZG gần nhất kể cả cuối tuần.")
 
     schedule.every().day.at("09:00").do(job_daily_summary)
     schedule.every(20).minutes.do(job_realtime)
