@@ -1,4 +1,4 @@
-import os, time, logging, requests, feedparser, schedule, pytz, re
+import os, time, logging, requests, feedparser, schedule, pytz, threading, re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -12,7 +12,7 @@ VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
 DATA_DIR = "data"
 SENT_FILE = os.path.join(DATA_DIR, "sent_links.txt")
-LOG_FILE = "miza_news_v23.log"
+LOG_FILE = "miza_news_v19.log"
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -20,6 +20,7 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s -
 # TELEGRAM
 # ======================
 def send_telegram(msg, image_url=None):
+    """Gửi tin nhắn hoặc ảnh thumbnail kèm caption"""
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     for chat_id in CHAT_IDS:
         try:
@@ -58,8 +59,7 @@ def save_sent(link):
 RSS_FEEDS = {
     "Google News": "https://news.google.com/rss/search?q=(Miza+OR+MZG+OR+Giấy+Miza)&hl=vi&gl=VN&ceid=VN:vi",
     "Bing News": "https://www.bing.com/news/search?q=Miza+MZG&format=rss",
-    "YouTube Channel": "https://www.youtube.com/feeds/videos.xml?channel_id=UCd2aU53aTTxxLONczZc34BA",
-    "YouTube Search (VN)": "https://www.youtube.com/feeds/videos.xml?search_query=Miza+MZG+Giấy+Miza+Việt+Nam+\"Công+ty\"+\"Giấy\"",
+    "YouTube": "https://www.youtube.com/feeds/videos.xml?channel_id=UCd2aU53aTTxxLONczZc34BA",
     "VNExpress": "https://vnexpress.net/rss/doanh-nghiep.rss",
     "Cafef": "https://cafef.vn/rss/tai-chinh-doanh-nghiep.rss",
     "VietnamBiz": "https://vietnambiz.vn/kinh-doanh.rss"
@@ -95,19 +95,21 @@ def shorten_url(url):
     except:
         return url
 
-def is_vietnamese_text(text):
-    return bool(re.search(r"[áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ]", text, re.IGNORECASE))
-
+# ======================
+# YOUTUBE THUMBNAIL
+# ======================
 def get_youtube_thumbnail(link):
+    """Lấy ảnh thumbnail từ link YouTube"""
     match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", link)
     if match:
-        return f"https://img.youtube.com/vi/{match.group(1)}/hqdefault.jpg"
+        video_id = match.group(1)
+        return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
     return None
 
 # ======================
-# FETCH RSS + YOUTUBE
+# FETCH FEEDS
 # ======================
-def fetch_new_items(hours=72):
+def fetch_new_items(hours=48):
     cutoff = datetime.now(VN_TZ) - timedelta(hours=hours)
     sent_links = load_sent()
     seen_titles = set()
@@ -122,20 +124,12 @@ def fetch_new_items(hours=72):
                     continue
                 link = normalize_link(e.get("link", ""))
                 norm_title = normalize_title(title)
+
                 if link in sent_links or norm_title in seen_titles:
                     continue
 
                 pub = parse_date(e)
-                age_min = (datetime.now(VN_TZ) - pub).total_seconds() / 60
-
-                if not re.search(r"\b(Miza|MZG|Giấy Miza)\b", title, re.IGNORECASE):
-                    continue
-                if "youtube.com" in link and not is_vietnamese_text(title):
-                    continue
-                if pub < cutoff:
-                    continue
-
-                if age_min <= 5:
+                if pub >= cutoff and re.search(r"\b(Miza|MZG|Giấy Miza)\b", title, re.IGNORECASE):
                     seen_titles.add(norm_title)
                     new_items.append({
                         "title": title,
@@ -144,7 +138,6 @@ def fetch_new_items(hours=72):
                         "source": source
                     })
                     save_sent(link)
-
         except Exception as e:
             logging.error(f"RSS lỗi {source}: {e}")
 
@@ -152,114 +145,15 @@ def fetch_new_items(hours=72):
     return new_items
 
 # ======================
-# FETCH TIKTOK
-# ======================
-def fetch_tiktok_videos():
-    """Lấy video TikTok mới nhất về Miza trong 5 phút"""
-    url = "https://tiktok-scraper7.p.rapidapi.com/feed/search"
-    headers = {
-        "X-RapidAPI-Key": os.getenv("RAPID_API_KEY"),
-        "X-RapidAPI-Host": "tiktok-scraper7.p.rapidapi.com"
-    }
-    params = {"keywords": "Miza MZG Giấy Miza Việt Nam", "region": "VN", "count": "10"}
-
-    try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
-        data = res.json()
-    except Exception as e:
-        logging.error(f"TikTok API error: {e}")
-        return []
-
-    sent_links = load_sent()
-    new_videos = []
-    now = datetime.now(VN_TZ)
-
-    for v in data.get("data", {}).get("videos", []):
-        title = v.get("title") or v.get("desc", "")
-        link = v.get("webVideoUrl") or ""
-        pub_time = datetime.fromtimestamp(v.get("createTime", 0), tz=VN_TZ)
-        age_min = (now - pub_time).total_seconds() / 60
-
-        if (
-            age_min <= 5
-            and link not in sent_links
-            and re.search(r"(Miza|MZG|Giấy Miza)", title, re.IGNORECASE)
-            and is_vietnamese_text(title)
-        ):
-            new_videos.append({
-                "title": title,
-                "link": link,
-                "date": pub_time,
-                "source": "TikTok"
-            })
-            save_sent(link)
-
-    return new_videos
-
-# ======================
-# FETCH FACEBOOK
-# ======================
-def fetch_facebook_posts():
-    """Lấy bài viết Facebook mới có từ khóa Miza"""
-    access_token = os.getenv("FACEBOOK_ACCESS_TOKEN")
-    page_id = os.getenv("FACEBOOK_PAGE_ID")
-    if not access_token or not page_id:
-        logging.warning("⚠️ Thiếu FACEBOOK_ACCESS_TOKEN hoặc PAGE_ID.")
-        return []
-
-    url = f"https://graph.facebook.com/v17.0/{page_id}/posts"
-    params = {
-        "fields": "message,created_time,permalink_url",
-        "limit": 10,
-        "access_token": access_token
-    }
-
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
-    except Exception as e:
-        logging.error(f"Facebook API error: {e}")
-        return []
-
-    sent_links = load_sent()
-    new_posts = []
-    now = datetime.now(VN_TZ)
-
-    for post in data.get("data", []):
-        msg = post.get("message", "")
-        link = post.get("permalink_url", "")
-        created = datetime.fromisoformat(post.get("created_time").replace("Z", "+00:00")).astimezone(VN_TZ)
-        age_min = (now - created).total_seconds() / 60
-
-        if (
-            age_min <= 5
-            and re.search(r"(Miza|MZG|Giấy Miza)", msg, re.IGNORECASE)
-            and link not in sent_links
-        ):
-            new_posts.append({
-                "title": msg[:80] + "..." if len(msg) > 80 else msg,
-                "link": link,
-                "date": created,
-                "source": "Facebook"
-            })
-            save_sent(link)
-
-    return new_posts
-
-# ======================
 # JOBS
 # ======================
 def job_realtime_check():
-    new_items = fetch_new_items(hours=72)
-    new_tiktok = fetch_tiktok_videos()
-    new_facebook = fetch_facebook_posts()
-    all_items = new_items + new_tiktok + new_facebook
-
-    if not all_items:
-        logging.info("⏳ Không có tin mới trong 5 phút qua.")
+    new_items = fetch_new_items(hours=48)
+    if not new_items:
+        logging.info("⏳ Không có tin mới trong 48h qua.")
         return
 
-    for item in sorted(all_items, key=lambda x: x["date"], reverse=True):
+    for item in new_items:
         link = shorten_url(item["link"])
         caption = f"🆕 <b>{item['title']}</b>\n🗓️ {item['date'].strftime('%H:%M %d/%m/%Y')}\n({item['source']})\n🔗 {link}"
         thumbnail = None
@@ -285,14 +179,14 @@ def job_daily_summary():
 # MAIN LOOP
 # ======================
 def main():
-    send_telegram("🚀 Miza News Bot v23 khởi động! (72h, TikTok + Facebook + YouTube + RSS ✅)")
+    send_telegram("🚀 Miza News Bot v19 khởi động! (Hỗ trợ preview video YouTube 🎥)")
     logging.info("Bot started.")
 
     job_realtime_check()
     job_daily_summary()
 
     schedule.every().day.at("09:00").do(job_daily_summary)
-    schedule.every(5).minutes.do(job_realtime_check)
+    schedule.every(20).minutes.do(job_realtime_check)
 
     while True:
         schedule.run_pending()
